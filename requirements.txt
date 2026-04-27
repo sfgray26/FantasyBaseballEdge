@@ -1,0 +1,75 @@
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Database
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+alembic==1.13.1
+
+# Cache / Redis
+redis>=5.0
+
+# Scientific Computing (Version 7 model)
+numpy==1.26.3
+scipy==1.11.4
+pandas==2.1.4
+ortools>=9.8
+
+# HTTP & Web Scraping
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+httpx[http2]==0.27.0
+anyio==4.3.0
+cloudscraper>=1.2.0
+playwright>=1.40.0
+
+# Scheduling
+apscheduler==3.10.4
+tenacity==8.3.0
+tzdata
+
+# Logging
+structlog==24.1.0
+python-json-logger==2.0.7
+
+# Environment
+python-dotenv==1.0.1
+
+# Optional: Alerts
+twilio==8.13.0
+sendgrid==6.11.0
+
+# Optional: Dashboard (run separately)
+streamlit>=1.40.0
+plotly==5.18.0
+altair==5.2.0
+statsmodels==0.14.1
+
+# Development
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+black==24.1.1
+flake8==7.0.0
+mypy==1.8.0
+
+# Deployment
+gunicorn==21.2.0
+duckduckgo-search>=5.0
+rapidfuzz==3.6.1
+
+# Caching (Railway Redis - K-31)
+redis>=5.0.0
+msgpack>=1.0.0
+
+# Fantasy Baseball — Yahoo API + Statcast enrichment
+pybaseball>=2.2.5
+MLB-StatsAPI>=1.7.0
+requests-oauthlib==2.0.0
+xmltodict==0.13.0
+python-dotenv>=1.0.0
