@@ -51,6 +51,7 @@ from backend.models import (
     PositionEligibility,
     ProbablePitcherSnapshot,
     DataIngestionLog,
+    StatcastPerformance,
     engine,
 )
 from backend.services.explainability_layer import ExplanationInput, explain_batch
@@ -1839,21 +1840,27 @@ class DailyIngestionOrchestrator:
 
         Algorithm:
           1. Query all mlb_player_stats rows for the past 30 days (max window)
-          2. Compute 7/14/30-day decay-weighted windows for every player with data
-          3. Upsert to player_rolling_stats on (bdl_player_id, as_of_date, window_days)
+          2. Query all statcast_performances rows for the same date range
+          3. Compute 7/14/30-day decay-weighted windows for every player with data
+             using compute_all_rolling_windows_with_statcast (P28 Phase 1)
+          4. Upsert to player_rolling_stats on (bdl_player_id, as_of_date, window_days)
 
         Anomaly: logs WARNING if 0 players processed (likely off-day or box stats missing).
         """
         t0 = time.monotonic()
 
         async def _run():
-            from backend.services.rolling_window_engine import compute_all_rolling_windows
+            from backend.services.rolling_window_engine import (
+                compute_all_rolling_windows_with_statcast,
+                StatcastDailyRow,
+            )
 
             as_of_date = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)
             lookback_start = as_of_date - timedelta(days=30)
 
             db = SessionLocal()
             try:
+                # Step 1: Fetch BDL box stats
                 rows = (
                     db.query(MLBPlayerStats)
                     .filter(
@@ -1862,6 +1869,35 @@ class DailyIngestionOrchestrator:
                     )
                     .all()
                 )
+
+                # Step 2: Fetch Statcast data for the same window
+                statcast_rows = (
+                    db.query(StatcastPerformance)
+                    .filter(
+                        StatcastPerformance.game_date >= lookback_start,
+                        StatcastPerformance.game_date <= as_of_date,
+                    )
+                    .all()
+                )
+
+                # Convert StatcastPerformance ORM rows to StatcastDailyRow
+                statcast_daily_rows = []
+                for sc in statcast_rows:
+                    statcast_daily_rows.append(
+                        StatcastDailyRow(
+                            player_id=sc.player_id,
+                            game_date=sc.game_date,
+                            exit_velocity_avg=sc.exit_velocity_avg if sc.exit_velocity_avg > 0 else None,
+                            launch_angle_avg=sc.launch_angle_avg if sc.launch_angle_avg > 0 else None,
+                            hard_hit_pct=sc.hard_hit_pct if sc.hard_hit_pct > 0 else None,
+                            barrel_pct=sc.barrel_pct if sc.barrel_pct > 0 else None,
+                            xwoba=sc.xwoba if sc.xwoba > 0 else None,
+                            xba=sc.xba if sc.xba > 0 else None,
+                            xslg=sc.xslg if sc.xslg > 0 else None,
+                            woba=sc.woba if sc.woba > 0 else None,
+                        )
+                    )
+
             except Exception as exc:
                 db.close()
                 logger.error("rolling_windows: DB query failed: %s", exc)
@@ -1885,8 +1921,10 @@ class DailyIngestionOrchestrator:
                     "elapsed_ms": elapsed,
                 }
 
-            results = compute_all_rolling_windows(
+            # Step 3: Compute Statcast-enhanced rolling windows
+            results = compute_all_rolling_windows_with_statcast(
                 rows,
+                statcast_daily_rows,
                 as_of_date=as_of_date,
                 window_sizes=[7, 14, 30],
             )
@@ -1932,6 +1970,15 @@ class DailyIngestionOrchestrator:
                         w_era=res.w_era,
                         w_whip=res.w_whip,
                         w_k_per_9=res.w_k_per_9,
+                        # P28 Phase 1: Statcast advanced metrics
+                        w_exit_velocity_avg=res.w_exit_velocity_avg,
+                        w_launch_angle_avg=res.w_launch_angle_avg,
+                        w_hard_hit_pct=res.w_hard_hit_pct,
+                        w_barrel_pct=res.w_barrel_pct,
+                        w_xwoba=res.w_xwoba,
+                        w_xba=res.w_xba,
+                        w_xslg=res.w_xslg,
+                        w_xwoba_minus_woba=res.w_xwoba_minus_woba,
                         computed_at=now,
                     ).on_conflict_do_update(
                         constraint="_prs_player_date_window_uc",
@@ -1961,6 +2008,15 @@ class DailyIngestionOrchestrator:
                             w_era=res.w_era,
                             w_whip=res.w_whip,
                             w_k_per_9=res.w_k_per_9,
+                            # P28 Phase 1: Statcast advanced metrics
+                            w_exit_velocity_avg=res.w_exit_velocity_avg,
+                            w_launch_angle_avg=res.w_launch_angle_avg,
+                            w_hard_hit_pct=res.w_hard_hit_pct,
+                            w_barrel_pct=res.w_barrel_pct,
+                            w_xwoba=res.w_xwoba,
+                            w_xba=res.w_xba,
+                            w_xslg=res.w_xslg,
+                            w_xwoba_minus_woba=res.w_xwoba_minus_woba,
                             computed_at=now,
                         ),
                     )

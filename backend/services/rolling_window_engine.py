@@ -111,6 +111,16 @@ class RollingWindowResult:
     w_whip: Optional[float] = None      # (w_hits_allowed + w_walks_allowed) / w_ip
     w_k_per_9: Optional[float] = None   # 9 * w_strikeouts_pit / w_ip
 
+    # Statcast advanced metrics (P28 Phase 1)
+    w_exit_velocity_avg: Optional[float] = None  # Avg exit velocity (mph)
+    w_launch_angle_avg: Optional[float] = None   # Avg launch angle (degrees)
+    w_hard_hit_pct: Optional[float] = None       # % batted balls >= 95 mph
+    w_barrel_pct: Optional[float] = None         # % ideal EV + LA combinations
+    w_xwoba: Optional[float] = None              # Expected wOBA
+    w_xba: Optional[float] = None                # Expected batting average
+    w_xslg: Optional[float] = None               # Expected slugging
+    w_xwoba_minus_woba: Optional[float] = None   # Luck differential (xwOBA - wOBA)
+
 
 # ---------------------------------------------------------------------------
 # Core rolling window computation
@@ -368,6 +378,251 @@ def compute_all_rolling_windows(
         for window in window_sizes:
             result = compute_rolling_window(
                 player_rows,
+                as_of_date=as_of_date,
+                window_days=window,
+                decay_lambda=decay_lambda,
+            )
+            if result is not None:
+                results.append(result)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Statcast-enhanced rolling windows (P28 Phase 1)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StatcastDailyRow:
+    """
+    Lightweight dataclass for one player's Statcast data on one day.
+
+    Used by compute_all_rolling_windows_with_statcast to merge Statcast
+    metrics into rolling window computation without requiring a full ORM
+    import at module top level (keeping the engine pure).
+    """
+    player_id: str          # e.g. "mlbam:12345" or BDL player ID string
+    game_date: date
+    exit_velocity_avg: Optional[float] = None
+    launch_angle_avg: Optional[float] = None
+    hard_hit_pct: Optional[float] = None
+    barrel_pct: Optional[float] = None
+    xwoba: Optional[float] = None
+    xba: Optional[float] = None
+    xslg: Optional[float] = None
+    woba: Optional[float] = None
+
+
+def compute_rolling_window_with_statcast(
+    stat_rows: list,
+    statcast_rows: list[StatcastDailyRow],
+    as_of_date: date,
+    window_days: int,
+    decay_lambda: float = 0.95,
+) -> Optional[RollingWindowResult]:
+    """
+    Compute decay-weighted rolling window WITH Statcast advanced metrics.
+
+    This is a thin wrapper around compute_rolling_window that additionally
+    merges Statcast data (exit velocity, barrel%, xwOBA, etc.) into the
+    result. Statcast rows are matched by (player_id, game_date) and
+    decay-weighted using the same exponential formula.
+
+    Args:
+        stat_rows:       Traditional BDL box stats (same as compute_rolling_window).
+        statcast_rows:   StatcastDailyRow objects for the same player/date range.
+        as_of_date:      Window end date.
+        window_days:     Look-back window.
+        decay_lambda:    Exponential decay factor.
+
+    Returns:
+        RollingWindowResult with Statcast fields populated, or None if no
+        games in window.
+    """
+    # Compute base rolling window from traditional stats
+    result = compute_rolling_window(
+        stat_rows,
+        as_of_date=as_of_date,
+        window_days=window_days,
+        decay_lambda=decay_lambda,
+    )
+    if result is None:
+        return None
+
+    # Build lookup: (player_id, game_date) -> StatcastDailyRow
+    statcast_lookup: dict[tuple[str, date], StatcastDailyRow] = {}
+    for sc_row in statcast_rows:
+        key = (sc_row.player_id, sc_row.game_date)
+        statcast_lookup[key] = sc_row
+
+    # Determine the player's ID string from BDL rows first
+    player_id_str = None
+    if stat_rows:
+        first_row = stat_rows[0]
+        for attr in ("bdl_player_id", "player_id", "mlbam_id"):
+            val = getattr(first_row, attr, None)
+            if val is not None:
+                player_id_str = str(val)
+                break
+
+    if player_id_str is None:
+        # No player ID available
+        return result
+
+    # Check if any Statcast rows actually match this player
+    # Try multiple ID formats that might appear in Statcast data
+    matching_statcast_rows = []
+    for sc in statcast_rows:
+        sc_pid = sc.player_id
+        # Match exact string, or prefixed versions
+        if sc_pid == player_id_str:
+            matching_statcast_rows.append(sc)
+        elif sc_pid.endswith(f":{player_id_str}"):
+            matching_statcast_rows.append(sc)
+        elif sc_pid == f"mlbam:{player_id_str}":
+            matching_statcast_rows.append(sc)
+
+    if not matching_statcast_rows:
+        # No Statcast data for this specific player
+        return result
+
+    # Use the matching statcast rows going forward
+    statcast_rows = matching_statcast_rows
+
+    # Rebuild lookup with filtered rows — use normalized player_id_str as key
+    statcast_lookup = {}
+    for sc_row in statcast_rows:
+        key = (player_id_str, sc_row.game_date)
+        statcast_lookup[key] = sc_row
+
+    # Accumulate decay-weighted Statcast metrics
+    sum_w_ev = 0.0
+    sum_w_la = 0.0
+    sum_w_hh = 0.0
+    sum_w_br = 0.0
+    sum_w_xw = 0.0
+    sum_w_xb = 0.0
+    sum_w_xs = 0.0
+    sum_w_wb = 0.0  # wOBA (for luck differential)
+    sum_weights_statcast = 0.0
+    n_statcast_games = 0
+
+    for row in stat_rows:
+        gd = getattr(row, "game_date", None)
+        if gd is None:
+            continue
+        days_back = (as_of_date - gd).days
+        if not (0 <= days_back < window_days):
+            continue
+
+        key = (player_id_str, gd)
+        sc = statcast_lookup.get(key)
+        if sc is None:
+            continue
+
+        # Only count Statcast rows that have at least one meaningful metric.
+        # Treat all-None or all-zero as "no Statcast data for this game".
+        vals = [sc.exit_velocity_avg, sc.launch_angle_avg, sc.hard_hit_pct,
+                sc.barrel_pct, sc.xwoba, sc.xba, sc.xslg, sc.woba]
+        if all(v is None or v == 0 for v in vals):
+            continue
+
+        w = decay_lambda ** days_back
+        sum_weights_statcast += w
+        n_statcast_games += 1
+
+        if sc.exit_velocity_avg is not None:
+            sum_w_ev += w * sc.exit_velocity_avg
+        if sc.launch_angle_avg is not None:
+            sum_w_la += w * sc.launch_angle_avg
+        if sc.hard_hit_pct is not None:
+            sum_w_hh += w * sc.hard_hit_pct
+        if sc.barrel_pct is not None:
+            sum_w_br += w * sc.barrel_pct
+        if sc.xwoba is not None:
+            sum_w_xw += w * sc.xwoba
+        if sc.xba is not None:
+            sum_w_xb += w * sc.xba
+        if sc.xslg is not None:
+            sum_w_xs += w * sc.xslg
+        if sc.woba is not None:
+            sum_w_wb += w * sc.woba
+
+    if n_statcast_games == 0:
+        # No Statcast data in window — return base result
+        return result
+
+    # Populate Statcast fields
+    if sum_weights_statcast > 0:
+        result.w_exit_velocity_avg = sum_w_ev / sum_weights_statcast if sum_w_ev > 0 else None
+        result.w_launch_angle_avg = sum_w_la / sum_weights_statcast if sum_w_la > 0 else None
+        result.w_hard_hit_pct = sum_w_hh / sum_weights_statcast if sum_w_hh > 0 else None
+        result.w_barrel_pct = sum_w_br / sum_weights_statcast if sum_w_br > 0 else None
+        result.w_xwoba = sum_w_xw / sum_weights_statcast if sum_w_xw > 0 else None
+        result.w_xba = sum_w_xb / sum_weights_statcast if sum_w_xb > 0 else None
+        result.w_xslg = sum_w_xs / sum_weights_statcast if sum_w_xs > 0 else None
+
+        # Luck differential: xwOBA - wOBA (positive = unlucky, negative = lucky)
+        if result.w_xwoba is not None and sum_w_wb > 0:
+            w_woba = sum_w_wb / sum_weights_statcast
+            result.w_xwoba_minus_woba = result.w_xwoba - w_woba
+
+    return result
+
+
+def compute_all_rolling_windows_with_statcast(
+    all_stat_rows: list,
+    all_statcast_rows: list[StatcastDailyRow],
+    as_of_date: date,
+    window_sizes: list = None,
+    decay_lambda: float = 0.95,
+) -> list:
+    """
+    Compute Statcast-enhanced rolling windows for all players x all window sizes.
+
+    Groups stat_rows by bdl_player_id, then matches Statcast rows by the
+    same player identifier. Calls compute_rolling_window_with_statcast for
+    each (player, window_size) pair.
+
+    Returns a flat list of RollingWindowResult objects with Statcast fields
+    populated where data is available.
+
+    Args:
+        all_stat_rows:       Traditional BDL box stats (mixed players).
+        all_statcast_rows:   StatcastDailyRow objects (mixed players).
+        as_of_date:          Compute windows ending on this date.
+        window_sizes:        List of window day counts (default: [7, 14, 30]).
+        decay_lambda:        Exponential decay per day (default: 0.95).
+    """
+    if window_sizes is None:
+        window_sizes = [7, 14, 30]
+
+    # Group BDL rows by player
+    players_bdl: dict[int, list] = {}
+    for row in all_stat_rows:
+        pid = row.bdl_player_id
+        players_bdl.setdefault(pid, []).append(row)
+
+    # Group Statcast rows by player_id string
+    players_statcast: dict[str, list[StatcastDailyRow]] = {}
+    for sc_row in all_statcast_rows:
+        players_statcast.setdefault(sc_row.player_id, []).append(sc_row)
+
+    results: list[RollingWindowResult] = []
+
+    for pid, bdl_rows in players_bdl.items():
+        # Resolve Statcast rows for this player
+        # Try multiple ID formats: raw bdl_player_id, "mlbam:{pid}", "{pid}"
+        sc_rows: list[StatcastDailyRow] = []
+        for key in [str(pid), f"mlbam:{pid}", f"bdl:{pid}"]:
+            if key in players_statcast:
+                sc_rows = players_statcast[key]
+                break
+
+        for window in window_sizes:
+            result = compute_rolling_window_with_statcast(
+                bdl_rows,
+                sc_rows,
                 as_of_date=as_of_date,
                 window_days=window,
                 decay_lambda=decay_lambda,

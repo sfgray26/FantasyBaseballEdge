@@ -1199,6 +1199,16 @@ class PlayerRollingStats(Base):
     w_whip          = Column(Float, nullable=True)   # (w_hits_allowed + w_walks_allowed) / w_ip
     w_k_per_9       = Column(Float, nullable=True)   # 9 * w_strikeouts_pit / w_ip
 
+    # Statcast advanced metrics (P28 Phase 1)
+    w_exit_velocity_avg = Column(Float, nullable=True)  # Avg exit velocity (mph)
+    w_launch_angle_avg  = Column(Float, nullable=True)  # Avg launch angle (degrees)
+    w_hard_hit_pct      = Column(Float, nullable=True)  # % of batted balls >= 95 mph
+    w_barrel_pct        = Column(Float, nullable=True)  # % ideal EV + LA combinations
+    w_xwoba             = Column(Float, nullable=True)  # Expected wOBA
+    w_xba               = Column(Float, nullable=True)  # Expected batting average
+    w_xslg              = Column(Float, nullable=True)  # Expected slugging
+    w_xwoba_minus_woba  = Column(Float, nullable=True)  # Luck differential (xwOBA - wOBA)
+
     computed_at     = Column(
         DateTime(timezone=True),
         nullable=False,
