@@ -54,6 +54,15 @@ PITCHER_CATEGORIES: dict[str, tuple[str, bool]] = {
     "z_k_per_9": ("w_k_per_9",     False),
 }
 
+# P28 Phase 2: Statcast component metrics that feed into z_power_quality.
+# These are computed internally (not exposed as standalone Z-scores) but
+# used to build the composite power quality Z.
+_STATCAST_COMPONENTS: dict[str, str] = {
+    "_z_barrel":    "w_barrel_pct",
+    "_z_hard_hit":  "w_hard_hit_pct",
+    "_z_ev":        "w_exit_velocity_avg",
+}
+
 # Combined for iteration convenience
 _ALL_CATEGORIES: dict[str, tuple[str, bool]] = {
     **HITTER_CATEGORIES,
@@ -94,6 +103,12 @@ class PlayerScoreResult:
     z_era:     Optional[float] = None
     z_whip:    Optional[float] = None
     z_k_per_9: Optional[float] = None
+
+    # P28 Phase 2: Statcast-derived power quality composite Z-score.
+    # Average of z_barrel, z_hard_hit, z_exit_velocity (component Zs computed
+    # internally from w_barrel_pct, w_hard_hit_pct, w_exit_velocity_avg).
+    # Higher = better batted-ball quality. Overlay on existing scoring.
+    z_power_quality: Optional[float] = None
 
     composite_z: float = 0.0   # mean of all applicable non-None Z-scores
     score_0_100: float = 50.0  # percentile rank 0-100 within player_type
@@ -187,6 +202,54 @@ def _mad(values: list[float]) -> float:
     return _median(abs_devs) * 1.4826
 
 
+def _compute_component_z(
+    pairs: list[tuple[int, float]],
+    winsorize: bool = True,
+    use_mad: bool = False,
+    min_sample: int = 2,
+) -> dict[int, float]:
+    """
+    Compute Z-scores for a single Statcast component (e.g., barrel%).
+
+    Args:
+        pairs: List of (player_id, raw_value) tuples.
+        winsorize: If True, clip at 5th/95th percentiles before stats.
+        use_mad: If True, use MAD-based robust Z.
+        min_sample: Minimum pairs needed (default 2, lower than main MIN_SAMPLE
+                   because components are already filtered to a qualified pool).
+
+    Returns:
+        Dict mapping player_id -> capped Z-score.
+        Empty dict if fewer than min_sample values.
+    """
+    if len(pairs) < min_sample:
+        return {}
+
+    values = [v for _, v in pairs]
+
+    if winsorize:
+        values_for_stats = _winsorize(values)
+    else:
+        values_for_stats = values
+
+    if use_mad:
+        center = _median(values_for_stats)
+        spread = _mad(values_for_stats)
+    else:
+        center = sum(values_for_stats) / len(values_for_stats)
+        spread = _population_std(values_for_stats)
+
+    if spread == 0.0:
+        return {}
+
+    result: dict[int, float] = {}
+    for player_id, val in pairs:
+        z = (val - center) / spread
+        result[player_id] = _cap(z)
+
+    return result
+
+
 def _detect_player_type(row) -> str:
     """
     Determine player type from a PlayerRollingStats row.
@@ -208,11 +271,11 @@ def _detect_player_type(row) -> str:
 def _applicable_z_keys(player_type: str) -> list[str]:
     """Return the Z-score field names applicable to a given player_type."""
     if player_type == "hitter":
-        return list(HITTER_CATEGORIES.keys())
+        return list(HITTER_CATEGORIES.keys()) + ["z_power_quality"]
     if player_type == "pitcher":
         return list(PITCHER_CATEGORIES.keys())
     if player_type == "two_way":
-        return list(HITTER_CATEGORIES.keys()) + list(PITCHER_CATEGORIES.keys())
+        return list(HITTER_CATEGORIES.keys()) + list(PITCHER_CATEGORIES.keys()) + ["z_power_quality"]
     return []
 
 
@@ -322,6 +385,56 @@ def compute_league_zscores(
             category_z_lookup[z_key][player_id] = _cap(z)
 
     # ------------------------------------------------------------------
+    # P28 Phase 2: Compute z_power_quality from Statcast components.
+    #
+    # Algorithm:
+    #   1. For each Statcast component (barrel%, hard_hit%, exit_velocity),
+    #      compute a league Z-score across the hitter+two_way pool.
+    #   2. For each player, average their available component Zs.
+    #   3. Store as z_power_quality (higher = better batted-ball quality).
+    #
+    # This is an OVERLAY: z_power_quality enters composite_z alongside
+    # traditional categories but does not replace z_hr or z_rbi.
+    # ------------------------------------------------------------------
+    power_quality_z: dict[int, float] = {}
+
+    # Build hitter+two_way pool for Statcast metrics
+    hitter_pool = [row for row in rolling_rows
+                   if _row_types.get(row.bdl_player_id) in ("hitter", "two_way")]
+
+    if len(hitter_pool) >= MIN_SAMPLE:
+        # Component 1: barrel%
+        barrel_pairs = [(r.bdl_player_id, float(r.w_barrel_pct))
+                        for r in hitter_pool
+                        if getattr(r, "w_barrel_pct", None) is not None]
+        barrel_z = _compute_component_z(barrel_pairs, winsorize, use_mad, min_sample=2) if len(barrel_pairs) >= 2 else {}
+
+        # Component 2: hard_hit%
+        hard_hit_pairs = [(r.bdl_player_id, float(r.w_hard_hit_pct))
+                          for r in hitter_pool
+                          if getattr(r, "w_hard_hit_pct", None) is not None]
+        hard_hit_z = _compute_component_z(hard_hit_pairs, winsorize, use_mad, min_sample=2) if len(hard_hit_pairs) >= 2 else {}
+
+        # Component 3: exit velocity
+        ev_pairs = [(r.bdl_player_id, float(r.w_exit_velocity_avg))
+                    for r in hitter_pool
+                    if getattr(r, "w_exit_velocity_avg", None) is not None]
+        ev_z = _compute_component_z(ev_pairs, winsorize, use_mad, min_sample=2) if len(ev_pairs) >= 2 else {}
+
+        # Average available component Zs per player
+        all_pids = set(barrel_z.keys()) | set(hard_hit_z.keys()) | set(ev_z.keys())
+        for pid in all_pids:
+            comp_zs = []
+            if pid in barrel_z:
+                comp_zs.append(barrel_z[pid])
+            if pid in hard_hit_z:
+                comp_zs.append(hard_hit_z[pid])
+            if pid in ev_z:
+                comp_zs.append(ev_z[pid])
+            if comp_zs:
+                power_quality_z[pid] = _cap(sum(comp_zs) / len(comp_zs))
+
+    # ------------------------------------------------------------------
     # Step 2: Build per-player results
     # ------------------------------------------------------------------
     results: list[PlayerScoreResult] = []
@@ -344,12 +457,17 @@ def compute_league_zscores(
 
         # Assign per-category Z-scores
         for z_key in applicable_keys:
-            z_val = category_z_lookup[z_key].get(pid)  # None if not computed
-            setattr(result, z_key, z_val)
+            if z_key == "z_power_quality":
+                # P28: Statcast composite is computed separately, not in category_z_lookup
+                result.z_power_quality = power_quality_z.get(pid)
+            else:
+                z_val = category_z_lookup[z_key].get(pid)  # None if not computed
+                setattr(result, z_key, z_val)
 
         # Step 3: composite_z = mean of all applicable non-None Z-scores.
         # P27: z_sb is excluded (superseded by z_nsb) to avoid double-counting
         # basestealing in the 5-category hitter composite.
+        # P28: z_power_quality IS included in composite (it's an overlay).
         non_none = [
             getattr(result, k)
             for k in applicable_keys
